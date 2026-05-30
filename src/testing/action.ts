@@ -48,11 +48,14 @@ export const ActionSuite: TestSuite = {
     const config = connection.getConfig();
 
     const workspaceFolder = vscode.workspace.workspaceFolders ? vscode.workspace.workspaceFolders[0] : undefined;
-    const tempDir = config.tempDir;
+    const tempDir = connection.getTempDirectory();
     assert.ok(workspaceFolder, "No workspace folder to work with");
     assert.ok(tempDir, "Cannot run deploy tools tests: no remote temp directory defined");
 
-    const tempDeployLocation = connection?.getTempRemote(`/some/dir`);
+    const tempRemote = connection.getTempRemote(`/some/dir`);
+    assert.ok(tempRemote, "No temp remote");
+
+    const tempDeployLocation = Tools.ensureFullPath(tempRemote, config.homeDirectory);
     await createFolder(workspaceFolder.uri, tempDeployLocation!, helloWorldProject);
     assert.ok(helloWorldProject.localPath, "Project has no local path");
     assert.ok(existsSync(helloWorldProject.localPath.fsPath), "Project local directory does not exist");
@@ -213,8 +216,8 @@ export const ActionSuite: TestSuite = {
           ],
         };
         const uri = getMemberUri({ library: tempLib, file: 'QRPGSRC', name: 'BADRPG', extension: srcType })
-        const success = await runAction(instance, uri, action, `all`);
-        assert.strictEqual(success, false);
+        const result = await runAction(instance, uri, action, `all`);
+        assert.strictEqual(result.success, false);
       }
     },
     {
@@ -331,7 +334,18 @@ export const ActionSuite: TestSuite = {
         assert.ok(success.success);
       }
     }
-  ]
+  ],
+  after: async () => {
+    // Clean up local test directory
+    if (helloWorldProject.localPath && existsSync(helloWorldProject.localPath.fsPath)) {
+      await vscode.workspace.fs.delete(helloWorldProject.localPath, { recursive: true, useTrash: false });
+    }
+
+    // Clean up remote test directory
+    if (helloWorldProject.remotePath && await instance.getConnection()?.getContent().isDirectory(helloWorldProject.remotePath)) {
+      await instance.getConnection()?.sendCommand({ command: `rm -rf ${helloWorldProject.remotePath}` });
+    }
+  }
 };
 
 /**

@@ -84,7 +84,7 @@ export class ExtendedIBMiContent {
         recordLength = Number(result.LENGTH);
       } else {
         const [result] = await connection.runSQL([
-          `@DSPFD FILE(${lib}/${spf}) TYPE(*ATR) OUTPUT(*OUTFILE) FILEATR(*PF) OUTFILE(QTEMP/PFS)`,
+          `@QSYS/DSPFD FILE(${lib}/${spf}) TYPE(*ATR) OUTPUT(*OUTFILE) FILEATR(*PF) OUTFILE(QTEMP/PFS)`,
           /* sql */
           `select PHMXRL - 12 as LENGTH from QTEMP.PFS limit 1`
         ]);
@@ -122,9 +122,16 @@ export class ExtendedIBMiContent {
       const client = connection.client!;
 
       const { library, file, name } = connection.parserMemberPath(uri.path);
-      const tempRmt = connection.getTempRemote(library + file + name);
+      const tempKey = library + file + name;
+      const tempRemote = connection.getTempRemote(tempKey);
+      if (!tempRemote) {
+        throw new Error(`Could not compute temporary remote location for ${tempKey}`);
+      }
+      const tempRmt = Tools.ensureFullPath(tempRemote, config.homeDirectory);
       if (tempRmt) {
         const tmpobj = await tmpFile();
+
+        try {
 
         const sourceData = body.split(`\n`);
         const recordLength = this.sourceDateHandler.recordLengths.get(alias) || await this.getRecordLength(aliasPath, library, file);
@@ -203,6 +210,10 @@ export class ExtendedIBMiContent {
         this.sourceDateHandler.baseSource.set(alias, body);
         this.sourceDateHandler.baseDates.set(alias, sourceDates);
         this.sourceDateHandler.baseSequences.delete(alias);
+        } finally {
+          // Clean up temporary file
+          await connection.clearTempRemote(tempKey);
+        }
       }
     }
   }

@@ -16,14 +16,14 @@ import { ConnectionManager } from './configuration/config/ConnectionManager';
 import { ConnectionConfig, RemoteConfigFile } from './configuration/config/types';
 import { ConfigFile } from './configuration/serverFile';
 import { CachedServerSettings, CodeForIStorage } from './configuration/storage/CodeForIStorage';
-import { AspInfo, CommandData, CommandResult, ConnectionData, EditorPath, IBMiMember, RemoteCommand, QsysPath, CacheItem } from './types';
+import { AspInfo, CacheItem, CommandData, CommandResult, ConnectionData, EditorPath, IBMiMember, QsysPath, RemoteCommand } from './types';
 
 export interface MemberParts extends IBMiMember {
   basename: string
 }
 
 export type ConnectionMessageType = 'info' | 'warning' | 'error';
-export type ConnectionErrorCode = `shell_config` | `home_directory_creation` | `QCPTOIMPF_exists` | `QCPFRMIMPF_exists` | `default_not_bash` | `invalid_bashrc` | `invalid_temp_lib` | `no_auto_conv_ebcdic` | `not_loaded_debug_config` | `no_sql_runner` | `ccsid_warning` | `component_signature_mismatch`;
+export type ConnectionErrorCode = `shell_config` | `home_directory_creation` | `home_directory_permissions` | `QCPTOIMPF_exists` | `QCPFRMIMPF_exists` | `default_not_bash` | `invalid_bashrc` | `invalid_temp_lib` | `no_auto_conv_ebcdic` | `not_loaded_debug_config` | `no_sql_runner` | `ccsid_warning` | `component_signature_mismatch`;
 
 export interface ConnectionResult {
   success: boolean
@@ -37,6 +37,10 @@ const remoteApps = [ // All names MUST also be defined as key in 'remoteFeatures
   {
     path: `/usr/bin/`,
     names: [`setccsid`, `iconv`, `attr`, `tar`, `ls`, `uname`]
+  },
+  {
+    path: `/QOpenSys/usr/bin/`,
+    names: [`openssl`]
   },
   {
     path: `/QOpenSys/pkgs/bin/`,
@@ -211,7 +215,7 @@ export default class IBMi {
 
   getConfig() {
     if (this.connected && this.config) {
-      return this.config!;
+      return this.config;
     } else {
       throw new Error(`Not connected to IBM i.`);
     }
@@ -219,6 +223,11 @@ export default class IBMi {
 
   setConfig(newConfig: ConnectionConfig) {
     this.config = newConfig;
+  }
+
+  getTempDirectory() {
+    const config = this.getConfig();
+    return Tools.ensureFullPath(config.tempDir, config.homeDirectory);
   }
 
   constructor() {
@@ -230,6 +239,7 @@ export default class IBMi {
       setccsid: undefined,
       md5sum: undefined,
       sha256sum: undefined,
+      openssl: undefined,
       bash: undefined,
       chsh: undefined,
       stat: undefined,
@@ -374,14 +384,14 @@ export default class IBMi {
       //   - stdout contains the name of the home directory (even if it does not exist)
       //   - The 'cd' command causes an error if the home directory does not exist or otherwise can't be cd'ed into
       //   - The 'test' command causes an error if the home directory is not writable (one can cd into a non-writable directory)
-      let isHomeUsable = (0 == echoHomeResult.code);
-      if (isHomeUsable) {
-        defaultHomeDir = echoHomeResult.stdout.trim();
+      const isHomeUsable = (0 == echoHomeResult.code);
+      const homeOutput = echoHomeResult.stdout.trim();
+      if (isHomeUsable && homeOutput && homeOutput !== "/") {
+        defaultHomeDir = homeOutput;
       } else {
         // Let's try to provide more valuable information to the user about why their home directory
         // is bad and maybe even provide the opportunity to create the home directory
-
-        let actualHomeDir = echoHomeResult.stdout.trim();
+        let actualHomeDir = homeOutput;
 
         // we _could_ just assume the home directory doesn't exist but maybe there's something more going on, namely mucked-up permissions
         let doesHomeExist = (0 === (await this.sendCommand({ command: `test -e ${actualHomeDir}` })).code);
@@ -414,11 +424,57 @@ export default class IBMi {
         }
       }
 
+      if(!defaultHomeDir || defaultHomeDir === "/"){
+        defaultHomeDir = `/home/${connectionObject.username}`;
+        //We'll warn only once
+        if(!this.config.homeDirectory || this.config.homeDirectory === "/"){
+          callbacks.message(`warning`, `Your home directory is set to '/' on your user profile. Code for IBM i will use ${defaultHomeDir} instead. Please contact a system administrator to fix this.`);
+        }
+      }
+
       // Check to see if we need to store a new value for the home directory
       if (defaultHomeDir) {
         if (this.config.homeDirectory !== defaultHomeDir) {
           this.config.homeDirectory = defaultHomeDir;
           callbacks.message(`info`, `Configured home directory reset to ${defaultHomeDir}.`);
+        }
+
+        // Check permissions on home directory and .vscode folder
+        callbacks.progress({
+          message: `Checking directory permissions.`
+        });
+
+        // Get home directory permissions (stat -c '%a' returns octal permissions)
+        const getPermissions = async (path: string) => {
+          let permissions = (await this.sendCommand({
+            command: `stat -c '%a' ${path} 2>/dev/null || echo "error"`
+          })).stdout.trim();
+          return permissions.length > 3 ? permissions.substring(1, 4) : permissions;
+        };
+
+        const homePerms = await getPermissions(defaultHomeDir);
+
+        // Check if .vscode directory exists and get its permissions
+        const vscodeDir = `${defaultHomeDir}/.vscode`;
+        const vscodeExistsResult = await this.sendCommand({
+          command: `test -d ${vscodeDir} && echo "exists" || echo "notexists"`
+        });
+        const vscodeExists = vscodeExistsResult.stdout.trim() === 'exists';
+        const vscodePerms = vscodeExists ? await getPermissions(vscodeDir) : '';
+
+        // Check if permissions need updating
+        const needsPermissionUpdate =
+          (homePerms !== 'error' && homePerms !== '750') ||
+          !vscodeExists ||
+          (vscodeExists && vscodePerms !== 'error' && vscodePerms !== '700');
+
+        if (needsPermissionUpdate && !options.reconnecting) {
+          await callbacks.uiErrorHandler(this, `home_directory_permissions`, {
+            homeDir: defaultHomeDir,
+            homePerms: homePerms !== 'error' ? homePerms : undefined,
+            vscodeExists,
+            vscodePerms: vscodePerms !== 'error' ? vscodePerms : undefined
+          });
         }
       } else {
         // New connections always have `.` as the initial value.
@@ -427,10 +483,10 @@ export default class IBMi {
         this.config.homeDirectory = `.`;
       }
 
-      // Migration: update old default tempDir (/tmp) to new default (.vscode/tmp)
-      if (this.config.tempDir === `/tmp`) {
-        this.config.tempDir = `.vscode/tmp`;
-        callbacks.message(`info`, `Temporary directory updated to ${this.getConfig().homeDirectory}/.vscode/tmp`);
+      // Migration: update old default tempDir (/tmp) to new default (~/.vscode/tmp)
+      if (this.config.tempDir === `/tmp` || this.config.tempDir === `.vscode/tmp`) {
+        this.config.tempDir = `~/.vscode/tmp`;
+        callbacks.message(`info`, `Temporary directory updated to ~/.vscode/tmp`);
       }
 
       //Set a default IFS listing
@@ -529,7 +585,7 @@ export default class IBMi {
       callbacks.progress({ message: `Checking Mapepire status.` });
       const tempDirSet = await this.checkOrCreateTempDirectory();
       if (!tempDirSet) {
-        this.config.tempDir = `.vscode/tmp`;
+        this.config.tempDir = `~/.vscode/tmp`;
       }
 
       // We always start up Mapepire first
@@ -622,7 +678,7 @@ export default class IBMi {
           })
 
         this.sendCommand({
-          command: `rm -rf ${path.posix.join(this.getConfig().tempDir, `vscodetemp*`)}`
+          command: `rm -rf ${path.posix.join(this.getTempDirectory(), `vscodetemp*`)}`
         })
           .then(result => {
             // All good!
@@ -630,7 +686,7 @@ export default class IBMi {
           .catch(e => {
             // CPF2125: No objects deleted.
             // @ts-ignore We know the config exists.
-            callbacks.message(`error`, `Temporary data not cleared from ${this.getConfig().tempDir}.`);
+            callbacks.message(`error`, `Temporary data not cleared from ${this.getTempDirectory()}.`);
           });
       }
 
@@ -1072,32 +1128,25 @@ export default class IBMi {
   }
 
   private async checkOrCreateTempDirectory() {
-    let tempDirSet: boolean = false;
-
-    if (!this.config) {
-      return false;
-    }
-
+    const tempDir = this.getTempDirectory();
     let result = await this.sendCommand({
-      command: `[ -d "${this.getConfig().tempDir}" ]`
+      command: `[ -d "${tempDir}" ]`
     });
 
     if (result.code === 0) {
       // Directory exists
-      tempDirSet = true;
+      return true;
     } else {
       // Directory does not exist, try to create it
-      let result = await this.sendCommand({
-        command: `mkdir -p ${this.getConfig().tempDir}`
+      result = await this.sendCommand({
+        command: `mkdir -p ${tempDir}`
       });
       if (result.code === 0) {
         // Directory created
-        tempDirSet = true;
-      } else {
-        // Directory not created
+        return true;
       }
     }
-    return tempDirSet;
+    return false;
   }
 
   /**
@@ -1232,11 +1281,23 @@ export default class IBMi {
       return this.tempRemoteFiles[key];
     } else
       if (this.getConfig()) {
-        let value = path.posix.join(this.getConfig().tempDir, `vscodetemp-${Tools.makeid()}`);
+        let value = path.posix.join(this.getTempDirectory(), `vscodetemp-${Tools.makeid()}`);
         // console.log(`Using new temp: ${value}`);
         this.tempRemoteFiles[key] = value;
         return value;
       }
+  }
+
+  /**
+   * Cleans up a temp file and removes it from cache
+   * @param {string} key Key to the temp file to clean up
+   */
+  async clearTempRemote(key: string) {
+    const tempFile = this.tempRemoteFiles[key];
+    if (tempFile) {
+      await this.sendCommand({ command: `rm -rf ${tempFile}`, directory: `.` }).catch(() => { });
+      delete this.tempRemoteFiles[key];
+    }
   }
 
   parserMemberPath(string: string, checkExtension?: boolean): MemberParts {
@@ -1331,7 +1392,7 @@ export default class IBMi {
    * @param process the process that will run on the empty directory
    */
   async withTempDirectory<T>(process: (directory: string) => Promise<T>) {
-    const tempDirectory = Tools.ensureFullPath(`${this.getConfig()?.tempDir || '.vscode/tmp'}/code4itemp${Tools.makeid(20)}`, this.config?.homeDirectory);
+    const tempDirectory = path.posix.join(this.getTempDirectory(), `/code4itemp${Tools.makeid(20)}`);
     const prepareDirectory = await this.sendCommand({ command: `rm -rf ${tempDirectory} && mkdir -p ${tempDirectory}` });
     if (prepareDirectory.code === 0) {
       try {
@@ -1556,7 +1617,7 @@ export default class IBMi {
     let lookupPath: string | QsysPath;
 
     if (isQsysPath) {
-      
+
       const localPath: QsysPath = { ...path };
       localPath.asp = localPath.asp ? this.sysNameInAmerican(localPath.asp) : undefined;
       localPath.library = this.sysNameInAmerican(localPath.library);
